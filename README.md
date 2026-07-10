@@ -1,11 +1,19 @@
-# APICollector v0.0.4
+# APICollector - OWASP API Security Tester v0.0.5
 ### Proactive API Security Assessment for Burp Suite
 
 **APICollector** is a comprehensive Burp Suite extension designed to streamline the entire API security testing lifecycle. It bridges the gap between development artifacts (like OpenAPI specs or Postman collections) and professional security auditing.
 
 ---
 
-## 🚀 What's New in v0.0.4
+## 🚀 What's New in v0.0.5
+
+### 🔧 Stability & Performance Improvements
+- **Background processing** for large imports and request execution keeps Burp responsive.
+- **Project persistence fix** restores row-indexed `bodies`, `responses`, and `endpoint_findings` correctly after save/load.
+- **Thread-safe results storage** with lock protection for generated tests and cached responses.
+- **Clean unload support** via Burp `IExtensionStateListener` to stop running workers safely.
+- **Improved editor integration** with `IMessageEditorController` backing the embedded message editors.
+- **Context-aware menu** only adds **Send to APICollector** where it belongs.
 
 ### 📊 Assessment Analytics Dashboard
 - **Executive Mission Control**: A new visual dashboard featuring high-level metrics for your assessment.
@@ -35,6 +43,7 @@
 - **Vulnerability Revalidation**: Stateful tracking with side-by-side PoC vs. Retest evidence.
 - **Universal Parameter Decoding**: Automatic URL-decoding for human-readable parameter documentation.
 - **Native Burp Integration**: Full use of `IMessageEditor` for syntax highlighting and context menus.
+- **Responsive Workflow**: Background import and request execution prevents Burp UI freezes during large operations.
 
 ---
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import java.io.File
 import javax.swing.border
-from burp import IBurpExtender, ITab, IContextMenuFactory, IContextMenuInvocation, IMessageEditor, IMessageEditorController
+from burp import IBurpExtender, ITab, IContextMenuFactory, IContextMenuInvocation, IMessageEditor, IMessageEditorController, IExtensionStateListener
 from javax.swing import (
     JTabbedPane, JPanel, JLabel, JTable, JScrollPane, JSplitPane,
     JTextField, JTextArea, JButton, JComboBox, JCheckBox, JFileChooser,
@@ -18,13 +18,13 @@ from java.awt import Rectangle
 from java.net import URL
 from java.lang import Boolean
 import json
+import os
 from collections import OrderedDict
 import re
 import csv
 import threading
 import shlex
 from datetime import datetime
-import threading
 import traceback
 from java.awt.datatransfer import DataFlavor
 
@@ -164,12 +164,17 @@ class SimpleYamlParser:
          return None, None
 
 
-class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorController):
+class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorController, IExtensionStateListener):
 
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("APICollector v0.0.4")
+        callbacks.setExtensionName("APICollector - OWASP API Security Tester")
+        callbacks.registerExtensionStateListener(self)
+
+        self._running = True
+        self._data_lock = threading.Lock()
+        self.current_editor_row = -1
 
         self.env = {}
         self.bodies = {}
@@ -235,17 +240,51 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         self.log("Loaded")
 
+    def extensionUnloaded(self):
+        self._running = False
+
     def getHttpService(self):
-        return None  
+        if self.current_editor_row < 0:
+            return None
+        info = self.build_request_info(self.current_editor_row)
+        if not info:
+            return None
+        return self.helpers.buildHttpService(info['host'], info['port'], info['use_https'])
 
     def getRequest(self):
-        return None
+        if self.current_editor_row < 0:
+            return None
+        with self._data_lock:
+            cached = self.responses.get(self.current_editor_row)
+        if cached and cached.get('request'):
+            return self.helpers.stringToBytes(cached['request'])
+        info = self.build_request_info(self.current_editor_row)
+        if not info:
+            return None
+        return self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
 
     def getResponse(self):
+        if self.current_editor_row < 0:
+            return None
+        with self._data_lock:
+            cached = self.responses.get(self.current_editor_row)
+        if cached and cached.get('response'):
+            return self.helpers.stringToBytes(cached['response'])
         return None
 
     def createMenuItems(self, invocation):
         self.context_menu_invocation = invocation
+        context = invocation.getInvocationContext()
+        allowed_contexts = [
+            IContextMenuInvocation.CONTEXT_PROXY_HISTORY,
+            IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_REQUEST,
+            IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_RESPONSE,
+            IContextMenuInvocation.CONTEXT_TARGET_SITE_MAP_TABLE,
+            IContextMenuInvocation.CONTEXT_REPEATER_REQUEST,
+        ]
+        if context not in allowed_contexts:
+            return []
+
         menu_list = []
         menu_item = JMenuItem("Send to APICollector", actionPerformed=self.sendToAPICollector)
         menu_list.append(menu_item)
@@ -255,7 +294,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         messages = self.context_menu_invocation.getSelectedMessages()
         if not messages:
             return
-            
+        messages = list(messages)
+        t = threading.Thread(target=self._send_to_api_collector_background, args=(messages,))
+        t.start()
+
+    def _send_to_api_collector_background(self, messages):
+        entries = []
         for msg in messages:
             try:
                 req_info = self.helpers.analyzeRequest(msg)
@@ -266,17 +310,17 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 path = self.helpers.urlDecode(url.getPath())
                 if url.getQuery():
                     path += "?" + self.helpers.urlDecode(url.getQuery())
-                
+
                 headers = list(req_info.getHeaders())
                 auth_val = "Open"
                 for h in headers:
                     if h.lower().startswith("authorization:") or h.lower().startswith("cookie:"):
                         auth_val = "Auth"
                         break
-                
+
                 req_bytes = msg.getRequest()
                 req_str = self.helpers.bytesToString(req_bytes) if req_bytes else ""
-                
+
                 resp_bytes = msg.getResponse()
                 resp_str = ""
                 status_text = "Pending"
@@ -285,35 +329,27 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     status_code = resp_info.getStatusCode()
                     status_text = str(status_code)
                     resp_str = self.helpers.bytesToString(resp_bytes)
-                
-                def add_to_table():
-                    row_idx = self.model.getRowCount()
-                    self.model.addRow([
-                        domain, scheme, method, path, auth_val, "Medium", "API", status_text, "Pending"
-                    ])
-                    
-                    self.responses[row_idx] = {
-                        'request': req_str,
-                        'response': resp_str,
-                        'status': status_text
-                    }
-                    
-                    self.responses[row_idx] = {
-                        'request': req_str,
-                        'response': resp_str,
-                        'status': status_text
-                    }
-                    
-                    req_keys, res_keys = self._get_all_parameters(req_bytes, resp_bytes)
-                    self.param_model.addRow([method, path, ", ".join(sorted(req_keys)), ", ".join(sorted(res_keys))])
-                    
-                    self.stats.setText("Endpoint added from Context Menu.")
-                    
-                SwingUtilities.invokeLater(add_to_table)
-                
+
+                req_keys, res_keys = self._get_all_parameters(req_bytes, resp_bytes)
+                entries.append((domain, scheme, method, path, auth_val, req_str, resp_str, status_text, req_keys, res_keys))
             except Exception as e:
                 self.log("Context menu error: %s" % str(e))
                 traceback.print_exc()
+
+        def add_to_table():
+            for domain, scheme, method, path, auth_val, req_str, resp_str, status_text, req_keys, res_keys in entries:
+                row_idx = self.model.getRowCount()
+                self.model.addRow([domain, scheme, method, path, auth_val, "Medium", "API", status_text, "Pending"])
+                with self._data_lock:
+                    self.responses[row_idx] = {
+                        'request': req_str,
+                        'response': resp_str,
+                        'status': status_text
+                    }
+                self.param_model.addRow([method, path, ", ".join(sorted(req_keys)), ", ".join(sorted(res_keys))])
+                self.stats.setText("Endpoint added from Context Menu.")
+
+        SwingUtilities.invokeLater(add_to_table)
 
 
 
@@ -586,11 +622,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self.vuln_detail_tabs.addTab("Revalidation Evidence (Retest)", reval_panel)
         
         notes_panel = JPanel(BorderLayout())
-        self.vuln_notes_area = JTextArea(4, 20)
-        self.vuln_notes_area.setEditable(False)
-        self.vuln_notes_area.setLineWrap(True)
-        self.vuln_notes_area.setWrapStyleWord(True)
-        notes_panel.add(JScrollPane(self.vuln_notes_area), BorderLayout.CENTER)
+        self.vuln_notes_editor = self.callbacks.createTextEditor(self, False)
+        notes_panel.add(self.vuln_notes_editor.getComponent(), BorderLayout.CENTER)
         self.vuln_detail_tabs.addTab("Notes & Remediation", notes_panel)
         
         vuln_main_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.vuln_table), self.vuln_detail_tabs)
@@ -609,50 +642,57 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if chooser.showOpenDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
             return
 
+        selected_path = chooser.getSelectedFile().getAbsolutePath()
+        t = threading.Thread(target=self._import_api_file, args=(selected_path,))
+        t.start()
+
+    def _import_api_file(self, path):
         try:
-            raw = open(chooser.getSelectedFile().getAbsolutePath()).read()
+            raw = open(path).read()
             is_yaml = False
             root = None
             try:
                 root = json.loads(raw, object_pairs_hook=OrderedDict)
-            except:
-                try:
-                    root = SimpleYamlParser.parse(raw)
-                    if root:
-                        is_yaml = True
-                        self.log("Parsed as YAML (Embedded Parser)")
-                except Exception as ye:
-                    self.log("JSON and YAML parsing failed. Error: %s" % ye)
-                    return
+            except Exception:
+                root = SimpleYamlParser.parse(raw)
+                if root:
+                    is_yaml = True
+                    self.log("Parsed as YAML (Embedded Parser)")
 
-            
-            is_postman = False
-            if "info" in root:
-                info = root.get("info", {})
-                if "_postman_id" in info or "postman" in info.get("schema", ""):
-                     is_postman = True
-            
-            if root.get("_type") == "export":
-                self.log("Detected Insomnia export")
-                self.load_environment(root)
-                self.parse_insomnia(root)
-            elif "swagger" in root or "openapi" in root:
-                if is_yaml: self.log("Detected Swagger/OpenAPI (YAML). Keys: %s" % (list(root.keys()) if isinstance(root, dict) else "Not a dict"))
-                else: self.log("Detected Swagger/OpenAPI (JSON). Keys: %s" % (list(root.keys()) if isinstance(root, dict) else "Not a dict"))
-                self.parse_openapi(root)
-            elif is_postman:
-                self.log("Detected Postman Collection")
-                self.parse_postman(root)
-            else:
-                is_curl = self.parse_curl(raw)
-                if not is_curl:
-                    self.log("Unknown format. structure: %s" % (root.keys() if hasattr(root, "keys") else type(root)))
-                    self.parse_openapi(root) 
+            if root is None:
+                raise ValueError("Unable to parse import file")
+
+            def process_parsed():
+                is_postman = False
+                if "info" in root:
+                    info = root.get("info", {})
+                    if "_postman_id" in info or "postman" in info.get("schema", ""):
+                        is_postman = True
+
+                if root.get("_type") == "export":
+                    self.log("Detected Insomnia export")
+                    self.load_environment(root)
+                    self.parse_insomnia(root)
+                elif "swagger" in root or "openapi" in root:
+                    if is_yaml:
+                        self.log("Detected Swagger/OpenAPI (YAML). Keys: %s" % (list(root.keys()) if isinstance(root, dict) else "Not a dict"))
+                    else:
+                        self.log("Detected Swagger/OpenAPI (JSON). Keys: %s" % (list(root.keys()) if isinstance(root, dict) else "Not a dict"))
+                    self.parse_openapi(root)
+                elif is_postman:
+                    self.log("Detected Postman Collection")
+                    self.parse_postman(root)
                 else:
-                    self.log("Detected cURL command")
+                    is_curl = self.parse_curl(raw)
+                    if not is_curl:
+                        self.log("Unknown format. structure: %s" % (root.keys() if hasattr(root, "keys") else type(root)))
+                        self.parse_openapi(root)
+                    else:
+                        self.log("Detected cURL command")
 
-            self.update_dashboard(None)
+                self.update_dashboard(None)
 
+            SwingUtilities.invokeLater(process_parsed)
         except Exception as e:
             self.log("Import failed: %s" % e)
 
@@ -775,16 +815,18 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if True: 
             self.model.setRowCount(0)
             self.bodies = {}
-            self.responses = {} 
             self.api_spec = {}
             self.postman_item_count = 0
-            self.generated_tests_data = [] 
             self.vulnerabilities = []
             self.endpoint_findings = {}
             self.vuln_model.setRowCount(0)
             self.test_model.setRowCount(0)
             self.param_model.setRowCount(0)
-            
+
+            with self._data_lock:
+                self.responses = {}
+                self.generated_tests_data = [] 
+
             self.stats.setText("Data cleared")
             self.update_dashboard(None)
             self.tm_req_editor.setMessage(None, True)
@@ -797,7 +839,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.ep_res_editor.setMessage(None, False)
             self.vuln_req_editor.setMessage(None, False)
             self.vuln_res_editor.setMessage(None, False)
-            self.vuln_notes_area.setText("")
+            self.vuln_notes_editor.setText("")
         
         self.env_model.setRowCount(0)
         self.env_host.setText("")
@@ -1522,11 +1564,13 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             try:
                 path = chooser.getSelectedFile().getAbsolutePath()
+                with self._data_lock:
+                    snapshot = list(self.generated_tests_data)
                 with open(path, "wb") as f:
                     writer = csv.writer(f)
                     writer.writerow(["ID", "Group", "Method", "Path", "Violation", "Detail", "Request", "Response"])
                     
-                    for data in self.generated_tests_data:
+                    for data in snapshot:
                         info = data['info']
                         
                         t_id = data['id']
@@ -1542,7 +1586,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                         
                         writer.writerow([t_id, group, method, url_path, v_type, detail, req_str, resp_str])
                         
-                JOptionPane.showMessageDialog(self.main_panel, "Exported %d records to %s" % (len(self.generated_tests_data), path))
+                JOptionPane.showMessageDialog(self.main_panel, "Exported %d records to %s" % (len(snapshot), path))
             except Exception as e:
                 self.log("Export error: %s" % e)
                 JOptionPane.showMessageDialog(self.main_panel, "Error exporting CSV: %s" % e)
@@ -1555,7 +1599,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         self.stats.setText("Assessing %d endpoints..." % len(rows))
         self.test_model.setRowCount(0) 
-        self.generated_tests_data = []
+        with self._data_lock:
+            self.generated_tests_data = []
         
 
         t = threading.Thread(target=self._run_assessment, args=(rows,))
@@ -1564,80 +1609,88 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self.tabs.setSelectedIndex(3) 
 
     def _run_assessment(self, rows):
-        total_endpoints = len(rows)
-        violations_count = 0
-        
-        for idx, row in enumerate(rows):
-            SwingUtilities.invokeLater(lambda: self.stats.setText("Assessing %d/%d..." % (idx + 1, total_endpoints)))
+        try:
+            total_endpoints = len(rows)
+            violations_count = 0
             
-            info = self.build_request_info(row)
-            if not info: continue
-            
-            try:
-                req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
-                resp = self.callbacks.makeHttpRequest(
-                    info['host'],
-                    info['port'],
-                    info['use_https'],
-                    req_bytes
-                )
+            for idx, row in enumerate(rows):
+                if not self._running:
+                    break
+                SwingUtilities.invokeLater(lambda idx=idx: self.stats.setText("Assessing %d/%d..." % (idx + 1, total_endpoints)))
                 
-                if resp:
-                    r_info = self.helpers.analyzeResponse(resp)
-                    headers = r_info.getHeaders() 
-                    
-                    h_dict = {}
-                    for h in headers:
-                        if ":" in h:
-                            parts = h.split(":", 1)
-                            h_dict[parts[0].strip().lower()] = parts[1].strip()
-                    
-                    missing = []
-                    for m in self.compliance_rules.get("mandatory", []):
-                        if m.lower() not in h_dict:
-                            missing.append(m)
-                            violations_count += 1
-                            
-                    forbidden = []
-                    for f in self.compliance_rules.get("forbidden", []):
-                        if f.lower() in h_dict:
-                             forbidden.append(f)
-                             violations_count += 1
-                    
-                    group = self._get_path_group(info['url'].getPath())
-                    
-                    if not missing and not forbidden:
-                        self.store_violation(info, req_bytes, resp, "Compliant", "All checks passed", group)
-                    
-                    for m in missing:
-                         self.store_violation(info, req_bytes, resp, "Missing Mandatory Header", m, group)
-                    
-                    for f in forbidden:
-                          self.store_violation(info, req_bytes, resp, "Forbidden Header Present", "%s: %s" % (f, h_dict[f.lower()]), group)
+                info = self.build_request_info(row)
+                if not info:
+                    continue
 
-            except Exception as e:
-                self.log("Assessment error: %s" % e)
-        
-        files_checked = total_endpoints
-        
-        def update_final_ui():
-            msg = "Assessment Complete: Checked %d Endpoints. Found %d Violations" % (files_checked, violations_count)
-            self.comp_stats.setText(msg)
-            self.stats.setText("Assessment Complete.")
+                try:
+                    req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
+                    resp = self.callbacks.makeHttpRequest(
+                        info['host'],
+                        info['port'],
+                        info['use_https'],
+                        req_bytes
+                    )
+                    
+                    if resp:
+                        r_info = self.helpers.analyzeResponse(resp)
+                        headers = r_info.getHeaders()
+                        
+                        h_dict = {}
+                        for h in headers:
+                            if ":" in h:
+                                parts = h.split(":", 1)
+                                h_dict[parts[0].strip().lower()] = parts[1].strip()
+                        
+                        missing = []
+                        for m in self.compliance_rules.get("mandatory", []):
+                            if m.lower() not in h_dict:
+                                missing.append(m)
+                                violations_count += 1
+                                
+                        forbidden = []
+                        for f in self.compliance_rules.get("forbidden", []):
+                            if f.lower() in h_dict:
+                                forbidden.append(f)
+                                violations_count += 1
+                        
+                        group = self._get_path_group(info['url'].getPath())
+                        
+                        if not missing and not forbidden:
+                            self.store_violation(info, req_bytes, resp, "Compliant", "All checks passed", group)
+                        
+                        for m in missing:
+                            self.store_violation(info, req_bytes, resp, "Missing Mandatory Header", m, group)
+                        
+                        for f in forbidden:
+                            self.store_violation(info, req_bytes, resp, "Forbidden Header Present", "%s: %s" % (f, h_dict[f.lower()]), group)
 
-        SwingUtilities.invokeLater(update_final_ui)
+                except Exception as e:
+                    self.log("Assessment error: %s" % e)
+
+            files_checked = total_endpoints
+            
+            def update_final_ui():
+                msg = "Assessment Complete: Checked %d Endpoints. Found %d Violations" % (files_checked, violations_count)
+                self.comp_stats.setText(msg)
+                self.stats.setText("Assessment Complete.")
+
+            SwingUtilities.invokeLater(update_final_ui)
+        except Exception as e:
+            self.callbacks.printError("Compliance assessment error: %s" % e)
+            traceback.print_exc()
 
             
             
     def store_violation(self, info, req_bytes, resp_bytes, v_type, detail, group):
-        test_id = len(self.generated_tests_data)
-        self.generated_tests_data.append({
-            "id": test_id,
-            "info": info,
-            "request_bytes": req_bytes,
-            "response_bytes": resp_bytes,
-            "description": "%s: %s" % (v_type, detail)
-        })
+        with self._data_lock:
+            test_id = len(self.generated_tests_data)
+            self.generated_tests_data.append({
+                "id": test_id,
+                "info": info,
+                "request_bytes": req_bytes,
+                "response_bytes": resp_bytes,
+                "description": "%s: %s" % (v_type, detail)
+            })
         SwingUtilities.invokeLater(lambda: self.test_model.addRow([test_id, group, info['headers'][0].split(" ")[0], info['url'].getPath(), v_type, detail]))
 
 
@@ -1648,7 +1701,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         row = self.test_table.getSelectedRow()
         if row >= 0:
             test_id = self.test_model.getValueAt(row, 0)
-            data = self.generated_tests_data[test_id]
+            with self._data_lock:
+                data = self.generated_tests_data[test_id]
             self.tm_req_editor.setMessage(data['request_bytes'], True)
             
             resp = data.get('response_bytes')
@@ -1671,7 +1725,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         for row in rows:
             test_id = self.test_model.getValueAt(row, 0)
-            data = self.generated_tests_data[test_id]
+            with self._data_lock:
+                data = self.generated_tests_data[test_id]
             info = data['info']
             
             self.callbacks.sendToRepeater(
@@ -1684,7 +1739,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
     def clear_tests(self, event):
         self.test_model.setRowCount(0)
-        self.generated_tests_data = []
+        with self._data_lock:
+            self.generated_tests_data = []
         self.tm_req_editor.setMessage(None, True)
         self.tm_res_editor.setMessage(None, False)
         self.preview_btn.setEnabled(False)
@@ -1695,7 +1751,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         row = self.test_table.getSelectedRow()
         if row >= 0:
             test_id = self.test_model.getValueAt(row, 0)
-            data = self.generated_tests_data[test_id]
+            with self._data_lock:
+                data = self.generated_tests_data[test_id]
             self.tm_req_editor.setMessage(data['request_bytes'], True)
             resp = data.get('response_bytes')
             self.tm_res_editor.setMessage(resp, False)
@@ -1707,28 +1764,39 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             return
             
         row = self.test_table.getSelectedRow()
-        if row < 0: 
-            return 
+        if row < 0:
+            return
 
         test_id = self.test_model.getValueAt(row, 0)
-        data = self.generated_tests_data[test_id]
+        with self._data_lock:
+            data = self.generated_tests_data[test_id]
         info = data['info']
 
+        t = threading.Thread(target=self._do_test_request, args=(info, req_bytes))
+        t.start()
+
+    def _do_test_request(self, info, req_bytes):
         try:
-             
-             self.tm_res_editor.setMessage(self.helpers.stringToBytes("Sending..."), False)
-             resp = self.callbacks.makeHttpRequest(
-                 info['host'],
-                 info['port'],
-                 info['use_https'],
-                 req_bytes
-             )
-             
-             if resp:
-                 self.tm_res_editor.setMessage(resp, False)
+            def update_start():
+                self.tm_res_editor.setMessage(self.helpers.stringToBytes("Sending..."), False)
+            SwingUtilities.invokeLater(update_start)
+
+            resp = self.callbacks.makeHttpRequest(
+                info['host'],
+                info['port'],
+                info['use_https'],
+                req_bytes
+            )
+
+            if resp:
+                def update_complete():
+                    self.tm_res_editor.setMessage(resp, False)
+                SwingUtilities.invokeLater(update_complete)
         except Exception as e:
-            traceback.print_exc()
-            self.tm_res_editor.setMessage(self.helpers.stringToBytes("Error: %s" % e), False)
+            self.callbacks.printError("Test request error: %s" % e)
+            def update_error():
+                self.tm_res_editor.setMessage(self.helpers.stringToBytes("Error: %s" % e), False)
+            SwingUtilities.invokeLater(update_error)
 
     def build_request_info(self, row):
         try:
@@ -1810,12 +1878,14 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         row = self.table.getSelectedRow()
         if row >= 0:
+            self.current_editor_row = row
             status = self.model.getValueAt(row, 8)
             self.vuln_status_dropdown.setSelectedItem(status if status else "Pending")
             self._sync_findings_table(row)
             
-            if row in self.responses:
-                cached = self.responses[row]
+            with self._data_lock:
+                cached = self.responses.get(row)
+            if cached:
                 self.ep_req_editor.setMessage(self.helpers.stringToBytes(cached['request']), True)
                 self.ep_res_editor.setMessage(self.helpers.stringToBytes(cached['response']), False)
                 self.stats.setText("Showing cached response (Status: %s)" % cached['status'])
@@ -1825,9 +1895,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
                     self.ep_req_editor.setMessage(req_bytes, True)
                     self.ep_res_editor.setMessage(None, False)
-            
-            if self.autoScan.isSelected():
-                self.send_to_repeater(row)
+        else:
+            self.current_editor_row = -1
+
+        if self.autoScan.isSelected() and row >= 0:
+            self.send_to_repeater(row)
 
     def _sync_findings_table(self, row):
         self.modifying_findings = True
@@ -1890,6 +1962,16 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         return data
 
+    def _restore_indexed_dict(self, data_dict):
+        result = {}
+        for key, value in (data_dict or {}).items():
+            try:
+                int_key = int(key)
+            except Exception:
+                int_key = key
+            result[int_key] = value
+        return result
+
     def _load_project_data(self, data):
         """Restore workspace from serialized data."""
         self.clear_data(None, silent=True)
@@ -1900,9 +1982,9 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         for row in data.get('parameters', []):
             self.param_model.addRow(row)
             
-        self.endpoint_findings = data.get('findings', {})
-        self.bodies = data.get('bodies', {})
-        self.responses = data.get('responses', {})
+        self.endpoint_findings = self._restore_indexed_dict(data.get('findings', {}))
+        self.bodies = self._restore_indexed_dict(data.get('bodies', {}))
+        self.responses = self._restore_indexed_dict(data.get('responses', {}))
         self.env = data.get('env', {})
         self.compliance_rules = data.get('compliance_rules', {})
         
@@ -1911,7 +1993,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self.sync_env_table(None)
 
     def new_project(self, event):
-        confirm = JOptionPane.showConfirmDialog(None, "Start a new project? All unsaved data will be lost.", "New Project", JOptionPane.YES_NO_OPTION)
+        confirm = JOptionPane.showConfirmDialog(self.main_panel, "Start a new project? All unsaved data will be lost.", "New Project", JOptionPane.YES_NO_OPTION)
         if confirm == JOptionPane.YES_OPTION:
             self.clear_data(None, silent=True)
             self.current_project_file = None
@@ -1921,7 +2003,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         chooser = JFileChooser()
         filter = javax.swing.filechooser.FileNameExtensionFilter("APICollector Project (*.apic)", ["apic"])
         chooser.setFileFilter(filter)
-        if chooser.showOpenDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showOpenDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             try:
                 with open(file_path, 'r') as f:
@@ -1931,7 +2013,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 self.stats.setText("Project loaded: %s" % os.path.basename(file_path))
             except Exception as e:
                 self.log("Error loading project: %s" % e)
-                JOptionPane.showMessageDialog(None, "Failed to load project: %s" % e)
+                JOptionPane.showMessageDialog(self.main_panel, "Failed to load project: %s" % e)
 
     def save_project(self, event):
         if not self.current_project_file:
@@ -1945,12 +2027,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.stats.setText("Project saved: %s" % os.path.basename(self.current_project_file))
         except Exception as e:
             self.log("Save error: %s" % e)
-            JOptionPane.showMessageDialog(None, "Failed to save project: %s" % e)
+            JOptionPane.showMessageDialog(self.main_panel, "Failed to save project: %s" % e)
 
     def save_project_as(self, event):
         chooser = JFileChooser()
         chooser.setSelectedFile(java.io.File("my_project.apic"))
-        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             if not file_path.endswith(".apic"):
                 file_path += ".apic"
@@ -2032,7 +2114,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         row = self.table.getSelectedRow()
         f_row = self.findings_table.getSelectedRow()
         if row >= 0 and f_row >= 0:
-            confirm = JOptionPane.showConfirmDialog(None, "Delete this finding?", "Confirm", JOptionPane.YES_NO_OPTION)
+            confirm = JOptionPane.showConfirmDialog(self.main_panel, "Delete this finding?", "Confirm", JOptionPane.YES_NO_OPTION)
             if confirm == JOptionPane.YES_OPTION:
                 del self.endpoint_findings[row][f_row]
                 self._sync_findings_table(row)
@@ -2089,11 +2171,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 resp_str = self.helpers.bytesToString(resp)
                 status_text = "%d %s" % (status_code, "OK" if status_code == 200 else "")
                 
-                self.responses[row] = {
-                    'request': req_str_final,
-                    'response': resp_str,
-                    'status': status_text
-                }
+                with self._data_lock:
+                    self.responses[row] = {
+                        'request': req_str_final,
+                        'response': resp_str,
+                        'status': status_text
+                    }
                 
                 def update_complete():
                     if self.active_request_ids.get(row) == generation_id:
@@ -2110,11 +2193,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     pass 
             else:
                 self.log("No response received from server")
-                self.responses[row] = {
-                    'request': req_str_final,
-                    'response': "No response received.",
-                    'status': "No Response"
-                }
+                with self._data_lock:
+                    self.responses[row] = {
+                        'request': req_str_final,
+                        'response': "No response received.",
+                        'status': "No Response"
+                    }
                 
                 def update_no_response():
                     if self.active_request_ids.get(row) == generation_id:
@@ -2124,8 +2208,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 SwingUtilities.invokeLater(update_no_response)
                 
         except Exception as e:
-            traceback.print_exc()
-            self.log("Request error: %s" % str(e))
+            self.callbacks.printError("Request error: %s" % e)
             def update_error():
                 if self.active_request_ids.get(row) == generation_id:
                     self.model.setValueAt("Error", row, 7)
@@ -2153,7 +2236,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         response = self.ep_res_editor.getMessage()
         
         if not response:
-            confirm = JOptionPane.showConfirmDialog(None, 
+            confirm = JOptionPane.showConfirmDialog(self.main_panel, 
                 "No response captured yet. Do you want to mark it as vulnerable without response evidence?",
                 "Missing Evidence", JOptionPane.YES_NO_OPTION)
             if confirm != JOptionPane.YES_OPTION:
@@ -2188,7 +2271,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         notes_area = JTextArea(5, 20)
         dialog_panel.add(JScrollPane(notes_area))
         
-        result = JOptionPane.showConfirmDialog(None, dialog_panel, "Add Vulnerability", JOptionPane.OK_CANCEL_OPTION)
+        result = JOptionPane.showConfirmDialog(self.main_panel, dialog_panel, "Add Vulnerability", JOptionPane.OK_CANCEL_OPTION)
         
         if result == JOptionPane.OK_OPTION:
             vuln_id = len(self.vulnerabilities) + 1
@@ -2221,13 +2304,13 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
     def delete_vulnerability(self, event):
         row = self.vuln_table.getSelectedRow()
         if row >= 0:
-            confirm = JOptionPane.showConfirmDialog(None, "Are you sure you want to delete this finding?", "Confirm Deletion", JOptionPane.YES_NO_OPTION)
+            confirm = JOptionPane.showConfirmDialog(self.main_panel, "Are you sure you want to delete this finding?", "Confirm Deletion", JOptionPane.YES_NO_OPTION)
             if confirm == JOptionPane.YES_OPTION:
                 del self.vulnerabilities[row]
                 self.vuln_model.removeRow(row)
                 self.vuln_req_editor.setMessage(None, False)
                 self.vuln_res_editor.setMessage(None, False)
-                self.vuln_notes_area.setText("")
+                self.vuln_notes_editor.setText("")
 
     def vuln_selected(self, event):
         if event.getValueIsAdjusting(): return
@@ -2245,34 +2328,29 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             status = vuln.get('status', 'Open')
             self.reval_status_combo.setSelectedItem(status)
             
-            self.vuln_notes_area.setText("Notes:\n%s\n\nRemediation Recommendation:\n%s" % (vuln['notes'], vuln.get('remediation', 'N/A')))
-
-    def retest_finding(self, event):
-        row = self.vuln_table.getSelectedRow()
-        if row < 0:
-            self.stats.setText("Select a vulnerability to retest.")
-            return
+            self.vuln_notes_editor.setText("Notes:\n%s\n\nRemediation Recommendation:\n%s" % (vuln['notes'], vuln.get('remediation', 'N/A')))
+            parts = vuln['endpoint'].split(" ", 1)
+            target_row = -1
+            if len(parts) == 2:
+                m, p = parts[0], parts[1]
+                for i in range(self.model.getRowCount()):
+                    if self.model.getValueAt(i, 2) == m and self.model.getValueAt(i, 3) == p:
+                        target_row = i
+                        break
             
-        vuln = self.vulnerabilities[row]
-        req_bytes = self.helpers.stringToBytes(vuln['request'])
-        
-        target_row = -1
-        parts = vuln['endpoint'].split(" ", 1)
-        if len(parts) == 2:
-            m, p = parts[0], parts[1]
-            for i in range(self.model.getRowCount()):
-                if self.model.getValueAt(i, 2) == m and self.model.getValueAt(i, 3) == p:
-                    target_row = i
-                    break
-        
-        if target_row >= 0:
-            self.tabs.setSelectedIndex(0)
-            self.table.setRowSelectionInterval(target_row, target_row)
-            self.ep_req_editor.setMessage(req_bytes, True)
-            self.ep_res_editor.setMessage(b"", False)
-            self.stats.setText("Original PoC pushed to Executor. Modify and run to verify fix.")
-        else:
-            self.stats.setText("Could not find original endpoint in table.")
+            if target_row >= 0:
+                info = self.build_request_info(target_row)
+                if info:
+                    req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
+                    self.ep_req_editor.setMessage(req_bytes, True)
+                    self.ep_res_editor.setMessage(b"", False)
+                    self.tabs.setSelectedIndex(0)
+                    self.table.setRowSelectionInterval(target_row, target_row)
+                    self.stats.setText("Original PoC pushed to Executor. Modify and run to verify fix.")
+                else:
+                    self.stats.setText("Original endpoint found but request build failed.")
+            else:
+                self.stats.setText("Could not find original endpoint in table.")
 
     def mark_as_verified(self, event):
         v_row = self.vuln_table.getSelectedRow()
@@ -2286,7 +2364,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         retest_res = self.helpers.bytesToString(self.ep_res_editor.getMessage())
         
         if not retest_res:
-             JOptionPane.showMessageDialog(None, "Running the retest first is recommended to capture evidence.")
+             JOptionPane.showMessageDialog(self.main_panel, "Running the retest first is recommended to capture evidence.")
 
         new_status = self.reval_status_combo.getSelectedItem()
         
@@ -2331,7 +2409,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         chooser = JFileChooser()
         chooser.setSelectedFile(java.io.File("api_assessment_report.csv"))
-        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             with open(file_path, 'wb') as f:
                 writer = csv.writer(f)
@@ -2372,7 +2450,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         chooser = JFileChooser()
         chooser.setSelectedFile(java.io.File("api_security_report.md"))
-        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             with open(file_path, 'w') as f:
                 f.write("# API Security Assessment Report\n\n")
@@ -2470,7 +2548,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         chooser = JFileChooser()
         chooser.setSelectedFile(java.io.File("api_data_dictionary.csv"))
-        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             with open(file_path, 'wb') as f:
                 writer = csv.writer(f)
@@ -2491,7 +2569,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         chooser = JFileChooser()
         chooser.setSelectedFile(java.io.File("api_vulnerabilities.json"))
-        if chooser.showSaveDialog(None) == JFileChooser.APPROVE_OPTION:
+        if chooser.showSaveDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
             with open(file_path, 'w') as f:
                 json.dump(self.vulnerabilities, f, indent=2)
@@ -2508,8 +2586,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             return "OAuth2"
         if "bearer" in t:
             return "Bearer"
-        if "bearer" in t:
-            return "Bearer"
+        if "basic" in t:
+            return "Basic"
         return "API Key"
 
     def _get_path_group(self, path):
