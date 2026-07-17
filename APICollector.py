@@ -11,7 +11,7 @@ from javax.swing import (
 from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 from javax.swing.event import ListSelectionListener, HyperlinkListener, DocumentListener, UndoableEditListener
 from javax.swing.undo import UndoManager
-from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension, GridLayout, GridBagLayout, GridBagConstraints, Toolkit, KeyboardFocusManager
+from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension, GridLayout, GridBagLayout, GridBagConstraints, Toolkit, KeyboardFocusManager, Insets
 from java.awt.datatransfer import Clipboard, StringSelection, DataFlavor
 from java.awt.event import ActionListener, ActionEvent, KeyEvent, InputEvent
 from java.awt import Rectangle
@@ -2232,73 +2232,121 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.stats.setText("Select an endpoint first.")
             return
             
-        request = self.ep_req_editor.getMessage()
-        response = self.ep_res_editor.getMessage()
+        request_bytes = self.ep_req_editor.getMessage()
+        response_bytes = self.ep_res_editor.getMessage()
         
-        if not response:
+        if not response_bytes:
             confirm = JOptionPane.showConfirmDialog(self.main_panel, 
                 "No response captured yet. Do you want to mark it as vulnerable without response evidence?",
                 "Missing Evidence", JOptionPane.YES_NO_OPTION)
             if confirm != JOptionPane.YES_OPTION:
                 return
         
+        request = self.helpers.bytesToString(request_bytes) if request_bytes else ""
+        response = self.helpers.bytesToString(response_bytes) if response_bytes else ""
+        
         endpoint = "%s %s" % (self.model.getValueAt(row, 2), self.model.getValueAt(row, 3))
-        self._show_vuln_dialog(endpoint, request, response)
+        self._show_vuln_dialog(row, endpoint, request, response)
 
     def add_vulnerability(self, event):
-        self._show_vuln_dialog("", "", "")
+        row = self.table.getSelectedRow()
+        if row < 0:
+            self.stats.setText("Select an endpoint first.")
+            return
+        endpoint = "%s %s" % (self.model.getValueAt(row, 2), self.model.getValueAt(row, 3))
+        self._show_vuln_dialog(row, endpoint, "", "")
 
-    def _show_vuln_dialog(self, endpoint, request, response):
-        dialog_panel = JPanel(GridLayout(0, 1, 5, 5))
-        
-        dialog_panel.add(JLabel("Endpoint:"))
+    def _show_vuln_dialog(self, row, endpoint, request, response):
+        dialog_panel = JPanel(GridBagLayout())
+        dialog_panel.setBorder(javax.swing.border.EmptyBorder(12, 14, 4, 14))
+
+        gbc = GridBagConstraints()
+        gbc.insets = Insets(6, 4, 6, 4)
+        gbc.anchor = GridBagConstraints.WEST
+        gbc.gridx = 0
+        gbc.gridy = 0
+
+        label_font = Font("SansSerif", Font.BOLD, 12)
+        field_width = 320
+
+        def add_field_row(label_text, component, fill_vertical=False):
+            gbc.gridy += 1
+            gbc.gridx = 0
+            gbc.weightx = 0
+            gbc.weighty = 0
+            gbc.fill = GridBagConstraints.NONE
+            gbc.gridwidth = 1
+            lbl = JLabel(label_text)
+            lbl.setFont(label_font)
+            dialog_panel.add(lbl, gbc)
+
+            gbc.gridx = 1
+            gbc.weightx = 1.0
+            gbc.gridwidth = GridBagConstraints.REMAINDER
+            if fill_vertical:
+                gbc.fill = GridBagConstraints.BOTH
+                gbc.weighty = 1.0
+            else:
+                gbc.fill = GridBagConstraints.HORIZONTAL
+            dialog_panel.add(component, gbc)
+
         endpoint_field = JTextField(endpoint)
-        dialog_panel.add(endpoint_field)
-        
-        dialog_panel.add(JLabel("Severity:"))
+        endpoint_field.setEditable(False)
+        endpoint_field.setPreferredSize(Dimension(field_width, endpoint_field.getPreferredSize().height))
+        add_field_row("Endpoint:", endpoint_field)
+
         severity_box = JComboBox(["Critical", "High", "Medium", "Low", "Info"])
-        dialog_panel.add(severity_box)
-        
-        dialog_panel.add(JLabel("OWASP API Top 10 Category:"))
+        add_field_row("Severity:", severity_box)
+
         category_box = JComboBox(self.owasp_top_10)
-        dialog_panel.add(category_box)
-        
-        dialog_panel.add(JLabel("Status:"))
-        status_box = JComboBox(["New", "Confirmed", "False Positive", "Remediated"])
-        dialog_panel.add(status_box)
-        
-        dialog_panel.add(JLabel("Notes / Proof of Concept:"))
-        notes_area = JTextArea(5, 20)
-        dialog_panel.add(JScrollPane(notes_area))
-        
-        result = JOptionPane.showConfirmDialog(self.main_panel, dialog_panel, "Add Vulnerability", JOptionPane.OK_CANCEL_OPTION)
+        add_field_row("OWASP API Top 10 Category:", category_box)
+
+        notes_area = JTextArea(6, 32)
+        notes_area.setLineWrap(True)
+        notes_area.setWrapStyleWord(True)
+        notes_scroll = JScrollPane(notes_area)
+        notes_scroll.setPreferredSize(Dimension(field_width, 130))
+        add_field_row("Notes / Proof of Concept:", notes_scroll, fill_vertical=True)
+
+        gbc.gridy += 1
+        gbc.gridx = 1
+        gbc.gridwidth = GridBagConstraints.REMAINDER
+        gbc.weighty = 0
+        gbc.fill = GridBagConstraints.HORIZONTAL
+        evidence_note = JLabel("Evidence captured: request %d bytes, response %d bytes" % (len(request or ""), len(response or "")))
+        evidence_note.setFont(Font("SansSerif", Font.ITALIC, 11))
+        evidence_note.setForeground(Color.GRAY)
+        dialog_panel.add(evidence_note, gbc)
+
+        result = JOptionPane.showConfirmDialog(self.main_panel, dialog_panel, "Add Vulnerability", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
         
         if result == JOptionPane.OK_OPTION:
-            vuln_id = len(self.vulnerabilities) + 1
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
             
-            vuln_data = {
-                'id': vuln_id,
+            finding = {
                 'severity': severity_box.getSelectedItem(),
-                'type': category_box.getSelectedItem(),
-                'endpoint': endpoint_field.getText(),
-                'status': status_box.getSelectedItem(),
+                'owasp': category_box.getSelectedItem(),
+                'notes': notes_area.getText(),
+                'remediation': self.remediation_map.get(category_box.getSelectedItem(), ""),
                 'date': now,
                 'request': request,
                 'response': response,
-                'notes': notes_area.getText(),
-                'remediation': self.remediation_map.get(category_box.getSelectedItem(), "")
+                'reval_status': "Open",
+                'reval_request': "",
+                'reval_response': ""
             }
             
-            self.vulnerabilities.append(vuln_data)
-            self.vuln_model.addRow([
-                vuln_id, 
-                vuln_data['severity'],
-                vuln_data['type'],
-                vuln_data['endpoint'],
-                vuln_data['status'],
-                vuln_data['date']
-            ])
+            if row not in self.endpoint_findings:
+                self.endpoint_findings[row] = []
+            self.endpoint_findings[row].append(finding)
+            
+            if self.model.getValueAt(row, 8) != "Vulnerable":
+                self.model.setValueAt("Vulnerable", row, 8)
+                if self.table.getSelectedRow() == row:
+                    self.vuln_status_dropdown.setSelectedItem("Vulnerable")
+            
+            self._sync_findings_table(row)
+            self._rebuild_global_vulnerabilities()
             self.stats.setText("Vulnerability added to tracker.")
 
     def delete_vulnerability(self, event):
@@ -2306,8 +2354,31 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if row >= 0:
             confirm = JOptionPane.showConfirmDialog(self.main_panel, "Are you sure you want to delete this finding?", "Confirm Deletion", JOptionPane.YES_NO_OPTION)
             if confirm == JOptionPane.YES_OPTION:
-                del self.vulnerabilities[row]
-                self.vuln_model.removeRow(row)
+                vuln = self.vulnerabilities[row]
+                target_row = -1
+                parts = vuln['endpoint'].split(" ", 1)
+                if len(parts) == 2:
+                    m, p = parts[0], parts[1]
+                    for i in range(self.model.getRowCount()):
+                        if self.model.getValueAt(i, 2) == m and self.model.getValueAt(i, 3) == p:
+                            target_row = i
+                            break
+
+                if target_row >= 0 and target_row in self.endpoint_findings:
+                    findings = self.endpoint_findings[target_row]
+                    for i, f in enumerate(findings):
+                        if f['request'] == vuln['request'] and f['date'] == vuln['date']:
+                            del findings[i]
+                            break
+                    if not findings:
+                        del self.endpoint_findings[target_row]
+                        if self.model.getValueAt(target_row, 8) == "Vulnerable":
+                            self.model.setValueAt("Not Vulnerable", target_row, 8)
+                            if self.table.getSelectedRow() == target_row:
+                                self.vuln_status_dropdown.setSelectedItem("Not Vulnerable")
+                    self._sync_findings_table(target_row)
+
+                self._rebuild_global_vulnerabilities()
                 self.vuln_req_editor.setMessage(None, False)
                 self.vuln_res_editor.setMessage(None, False)
                 self.vuln_notes_editor.setText(self.helpers.stringToBytes(""))
@@ -2329,28 +2400,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.reval_status_combo.setSelectedItem(status)
             
             self.vuln_notes_editor.setText(self.helpers.stringToBytes("Notes:\n%s\n\nRemediation Recommendation:\n%s" % (vuln['notes'], vuln.get('remediation', 'N/A'))))
-            parts = vuln['endpoint'].split(" ", 1)
-            target_row = -1
-            if len(parts) == 2:
-                m, p = parts[0], parts[1]
-                for i in range(self.model.getRowCount()):
-                    if self.model.getValueAt(i, 2) == m and self.model.getValueAt(i, 3) == p:
-                        target_row = i
-                        break
-            
-            if target_row >= 0:
-                info = self.build_request_info(target_row)
-                if info:
-                    req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
-                    self.ep_req_editor.setMessage(req_bytes, True)
-                    self.ep_res_editor.setMessage(b"", False)
-                    self.tabs.setSelectedIndex(0)
-                    self.table.setRowSelectionInterval(target_row, target_row)
-                    self.stats.setText("Original PoC pushed to Executor. Modify and run to verify fix.")
-                else:
-                    self.stats.setText("Original endpoint found but request build failed.")
-            else:
-                self.stats.setText("Could not find original endpoint in table.")
 
     def retest_finding(self, event):
         v_row = self.vuln_table.getSelectedRow()
@@ -2359,6 +2408,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             return
 
         vuln = self.vulnerabilities[v_row]
+
+        if not vuln.get('request'):
+            self.stats.setText("No original PoC request captured for this finding.")
+            return
 
         target_row = -1
         parts = vuln['endpoint'].split(" ", 1)
@@ -2378,21 +2431,28 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.stats.setText("Could not build request info for retest.")
             return
 
-        req_bytes = self.ep_req_editor.getMessage()
-        if not req_bytes:
-            self.stats.setText("Executor request is empty. Re-select the finding to reload the PoC.")
-            return
+        orig_request = vuln['request']
+        orig_date = vuln['date']
+        req_bytes = self.helpers.stringToBytes(orig_request)
 
+        self.reval_req_editor.setMessage(req_bytes, False)
+        self.reval_res_editor.setMessage(self.helpers.stringToBytes("Sending..."), False)
         self.stats.setText("Retesting finding...")
-        t = threading.Thread(target=self._do_retest_request, args=(info, req_bytes))
+
+        t = threading.Thread(target=self._do_retest_request, args=(info, req_bytes, target_row, orig_request, orig_date))
         t.start()
 
-    def _do_retest_request(self, info, req_bytes):
-        try:
-            def update_start():
-                self.ep_res_editor.setMessage(self.helpers.stringToBytes("Sending..."), False)
-            SwingUtilities.invokeLater(update_start)
+    def _persist_retest_evidence(self, target_row, orig_request, orig_date, retest_req, retest_res):
+        if target_row in self.endpoint_findings:
+            for f in self.endpoint_findings[target_row]:
+                if f['request'] == orig_request and f['date'] == orig_date:
+                    f['reval_request'] = retest_req
+                    f['reval_response'] = retest_res
+                    return True
+        return False
 
+    def _do_retest_request(self, info, req_bytes, target_row, orig_request, orig_date):
+        try:
             resp = self.callbacks.makeHttpRequest(
                 info['host'],
                 info['port'],
@@ -2401,19 +2461,29 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             )
 
             if resp:
-                def update_complete():
-                    self.ep_res_editor.setMessage(resp, False)
-                    self.stats.setText("Retest complete. Review the response, set status, then click Mark as Verified.")
-                SwingUtilities.invokeLater(update_complete)
+                resp_str = self.helpers.bytesToString(resp)
+                status_msg = "Retest complete. Review the response, set status, then click Mark as Verified."
             else:
-                def update_no_response():
-                    self.ep_res_editor.setMessage(self.helpers.stringToBytes("No response received. Check if the server is running."), False)
-                    self.stats.setText("Retest failed: No response")
-                SwingUtilities.invokeLater(update_no_response)
+                resp_str = "No response received. Check if the server is running."
+                status_msg = "Retest failed: No response"
+
+            def update_complete():
+                self.reval_res_editor.setMessage(self.helpers.stringToBytes(resp_str), False)
+                self._persist_retest_evidence(target_row, orig_request, orig_date, orig_request, resp_str)
+                v_row = self.vuln_table.getSelectedRow()
+                if v_row >= 0 and v_row < len(self.vulnerabilities):
+                    vuln = self.vulnerabilities[v_row]
+                    if vuln['request'] == orig_request and vuln['date'] == orig_date:
+                        vuln['reval_request'] = orig_request
+                        vuln['reval_response'] = resp_str
+                self.stats.setText(status_msg)
+            SwingUtilities.invokeLater(update_complete)
         except Exception as e:
             self.callbacks.printError("Retest error: %s" % e)
             def update_error():
-                self.ep_res_editor.setMessage(self.helpers.stringToBytes("Error: %s" % e), False)
+                err_msg = "Error: %s" % e
+                self.reval_res_editor.setMessage(self.helpers.stringToBytes(err_msg), False)
+                self._persist_retest_evidence(target_row, orig_request, orig_date, orig_request, err_msg)
                 self.stats.setText("Error retesting finding")
             SwingUtilities.invokeLater(update_error)
 
@@ -2425,11 +2495,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             
         vuln = self.vulnerabilities[v_row]
         
-        retest_req = self.helpers.bytesToString(self.ep_req_editor.getMessage())
-        retest_res = self.helpers.bytesToString(self.ep_res_editor.getMessage())
-        
-        if not retest_res:
-             JOptionPane.showMessageDialog(self.main_panel, "Running the retest first is recommended to capture evidence.")
+        if not vuln.get('reval_response'):
+            confirm = JOptionPane.showConfirmDialog(self.main_panel, 
+                "No retest evidence captured yet. Click 'Retest Finding' first, or set status without it?",
+                "Missing Retest Evidence", JOptionPane.YES_NO_OPTION)
+            if confirm != JOptionPane.YES_OPTION:
+                return
 
         new_status = self.reval_status_combo.getSelectedItem()
         
@@ -2448,8 +2519,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             for f in findings:
                 if f['request'] == vuln['request'] and f['date'] == vuln['date']:
                     f['reval_status'] = new_status
-                    f['reval_request'] = retest_req
-                    f['reval_response'] = retest_res
                     status_updated = True
                     break
                     
@@ -2457,7 +2526,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self._rebuild_global_vulnerabilities()
             if v_row < self.vuln_table.getRowCount():
                 self.vuln_table.setRowSelectionInterval(v_row, v_row)
-            self.stats.setText("Revalidation captured for %s." % vuln['type'])
+            self.stats.setText("Status updated to '%s' for %s." % (new_status, vuln['type']))
         else:
             self.stats.setText("Error updating finding status.")
 
