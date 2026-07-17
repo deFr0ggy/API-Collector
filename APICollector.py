@@ -622,7 +622,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self.vuln_detail_tabs.addTab("Revalidation Evidence (Retest)", reval_panel)
         
         notes_panel = JPanel(BorderLayout())
-        self.vuln_notes_editor = self.callbacks.createTextEditor(self, False)
+        self.vuln_notes_editor = self.callbacks.createTextEditor()
         notes_panel.add(self.vuln_notes_editor.getComponent(), BorderLayout.CENTER)
         self.vuln_detail_tabs.addTab("Notes & Remediation", notes_panel)
         
@@ -839,7 +839,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.ep_res_editor.setMessage(None, False)
             self.vuln_req_editor.setMessage(None, False)
             self.vuln_res_editor.setMessage(None, False)
-            self.vuln_notes_editor.setText("")
+            self.vuln_notes_editor.setText(self.helpers.stringToBytes(""))
         
         self.env_model.setRowCount(0)
         self.env_host.setText("")
@@ -2310,7 +2310,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 self.vuln_model.removeRow(row)
                 self.vuln_req_editor.setMessage(None, False)
                 self.vuln_res_editor.setMessage(None, False)
-                self.vuln_notes_editor.setText("")
+                self.vuln_notes_editor.setText(self.helpers.stringToBytes(""))
 
     def vuln_selected(self, event):
         if event.getValueIsAdjusting(): return
@@ -2328,7 +2328,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             status = vuln.get('status', 'Open')
             self.reval_status_combo.setSelectedItem(status)
             
-            self.vuln_notes_editor.setText("Notes:\n%s\n\nRemediation Recommendation:\n%s" % (vuln['notes'], vuln.get('remediation', 'N/A')))
+            self.vuln_notes_editor.setText(self.helpers.stringToBytes("Notes:\n%s\n\nRemediation Recommendation:\n%s" % (vuln['notes'], vuln.get('remediation', 'N/A'))))
             parts = vuln['endpoint'].split(" ", 1)
             target_row = -1
             if len(parts) == 2:
@@ -2351,6 +2351,71 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     self.stats.setText("Original endpoint found but request build failed.")
             else:
                 self.stats.setText("Could not find original endpoint in table.")
+
+    def retest_finding(self, event):
+        v_row = self.vuln_table.getSelectedRow()
+        if v_row < 0:
+            self.stats.setText("Select a vulnerability in the tracker first.")
+            return
+
+        vuln = self.vulnerabilities[v_row]
+
+        target_row = -1
+        parts = vuln['endpoint'].split(" ", 1)
+        if len(parts) == 2:
+            m, p = parts[0], parts[1]
+            for i in range(self.model.getRowCount()):
+                if self.model.getValueAt(i, 2) == m and self.model.getValueAt(i, 3) == p:
+                    target_row = i
+                    break
+
+        if target_row < 0:
+            self.stats.setText("Could not find original endpoint in table.")
+            return
+
+        info = self.build_request_info(target_row)
+        if not info:
+            self.stats.setText("Could not build request info for retest.")
+            return
+
+        req_bytes = self.ep_req_editor.getMessage()
+        if not req_bytes:
+            self.stats.setText("Executor request is empty. Re-select the finding to reload the PoC.")
+            return
+
+        self.stats.setText("Retesting finding...")
+        t = threading.Thread(target=self._do_retest_request, args=(info, req_bytes))
+        t.start()
+
+    def _do_retest_request(self, info, req_bytes):
+        try:
+            def update_start():
+                self.ep_res_editor.setMessage(self.helpers.stringToBytes("Sending..."), False)
+            SwingUtilities.invokeLater(update_start)
+
+            resp = self.callbacks.makeHttpRequest(
+                info['host'],
+                info['port'],
+                info['use_https'],
+                req_bytes
+            )
+
+            if resp:
+                def update_complete():
+                    self.ep_res_editor.setMessage(resp, False)
+                    self.stats.setText("Retest complete. Review the response, set status, then click Mark as Verified.")
+                SwingUtilities.invokeLater(update_complete)
+            else:
+                def update_no_response():
+                    self.ep_res_editor.setMessage(self.helpers.stringToBytes("No response received. Check if the server is running."), False)
+                    self.stats.setText("Retest failed: No response")
+                SwingUtilities.invokeLater(update_no_response)
+        except Exception as e:
+            self.callbacks.printError("Retest error: %s" % e)
+            def update_error():
+                self.ep_res_editor.setMessage(self.helpers.stringToBytes("Error: %s" % e), False)
+                self.stats.setText("Error retesting finding")
+            SwingUtilities.invokeLater(update_error)
 
     def mark_as_verified(self, event):
         v_row = self.vuln_table.getSelectedRow()
