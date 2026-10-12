@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import java.io.File
 import javax.swing.border
+from javax.swing.filechooser import FileNameExtensionFilter
 from burp import IBurpExtender, ITab, IContextMenuFactory, IContextMenuInvocation, IMessageEditor, IMessageEditorController, IExtensionStateListener
 from javax.swing import (
     JTabbedPane, JPanel, JLabel, JTable, JScrollPane, JSplitPane,
@@ -829,16 +830,16 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
             self.stats.setText("Data cleared")
             self.update_dashboard(None)
-            self.tm_req_editor.setMessage(None, True)
-            self.tm_res_editor.setMessage(None, False)
+            self.tm_req_editor.setMessage(self.helpers.stringToBytes(""), True)
+            self.tm_res_editor.setMessage(self.helpers.stringToBytes(""), False)
             self.preview_btn.setEnabled(False)
             self.tm_send_btn.setEnabled(False)
             self.tm_reset_btn.setEnabled(False)
             
-            self.ep_req_editor.setMessage(None, True)
-            self.ep_res_editor.setMessage(None, False)
-            self.vuln_req_editor.setMessage(None, False)
-            self.vuln_res_editor.setMessage(None, False)
+            self.ep_req_editor.setMessage(self.helpers.stringToBytes(""), True)
+            self.ep_res_editor.setMessage(self.helpers.stringToBytes(""), False)
+            self.vuln_req_editor.setMessage(self.helpers.stringToBytes(""), False)
+            self.vuln_res_editor.setMessage(self.helpers.stringToBytes(""), False)
             self.vuln_notes_editor.setText(self.helpers.stringToBytes(""))
         
         self.env_model.setRowCount(0)
@@ -1712,8 +1713,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self.tm_send_btn.setEnabled(True)
             self.tm_reset_btn.setEnabled(True)
         else:
-            self.tm_req_editor.setMessage(None, True)
-            self.tm_res_editor.setMessage(None, False)
+            self.tm_req_editor.setMessage(self.helpers.stringToBytes(""), True)
+            self.tm_res_editor.setMessage(self.helpers.stringToBytes(""), False)
             self.preview_btn.setEnabled(False)
             self.tm_send_btn.setEnabled(False)
             self.tm_reset_btn.setEnabled(False)
@@ -1741,8 +1742,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self.test_model.setRowCount(0)
         with self._data_lock:
             self.generated_tests_data = []
-        self.tm_req_editor.setMessage(None, True)
-        self.tm_res_editor.setMessage(None, False)
+        self.tm_req_editor.setMessage(self.helpers.stringToBytes(""), True)
+        self.tm_res_editor.setMessage(self.helpers.stringToBytes(""), False)
         self.preview_btn.setEnabled(False)
         self.tm_send_btn.setEnabled(False)
         self.tm_reset_btn.setEnabled(False)
@@ -1894,7 +1895,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 if info:
                     req_bytes = self.helpers.buildHttpMessage(info['headers'], info['body'].encode('utf-8') if info['body'] else b"")
                     self.ep_req_editor.setMessage(req_bytes, True)
-                    self.ep_res_editor.setMessage(None, False)
+                    self.ep_res_editor.setMessage(self.helpers.stringToBytes(""), False)
         else:
             self.current_editor_row = -1
 
@@ -2001,7 +2002,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
     def open_project(self, event):
         chooser = JFileChooser()
-        filter = javax.swing.filechooser.FileNameExtensionFilter("APICollector Project (*.apic)", ["apic"])
+        filter = FileNameExtensionFilter("APICollector Project (*.apic)", ["apic"])
         chooser.setFileFilter(filter)
         if chooser.showOpenDialog(self.main_panel) == JFileChooser.APPROVE_OPTION:
             file_path = chooser.getSelectedFile().getAbsolutePath()
@@ -2379,8 +2380,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     self._sync_findings_table(target_row)
 
                 self._rebuild_global_vulnerabilities()
-                self.vuln_req_editor.setMessage(None, False)
-                self.vuln_res_editor.setMessage(None, False)
+                self.vuln_req_editor.setMessage(self.helpers.stringToBytes(""), False)
+                self.vuln_res_editor.setMessage(self.helpers.stringToBytes(""), False)
                 self.vuln_notes_editor.setText(self.helpers.stringToBytes(""))
 
     def vuln_selected(self, event):
